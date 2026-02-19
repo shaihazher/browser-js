@@ -53,6 +53,14 @@ bjs scroll <up|down|top|bottom> [px]
 bjs url                     Current URL
 bjs back / forward / refresh
 bjs wait <ms>
+
+Coordinate commands (cross-origin iframes, captchas, overlays):
+bjs click-xy <x> <y>       Click at page coordinates via CDP Input
+bjs click-xy <x> <y> --double   Double-click at coordinates
+bjs click-xy <x> <y> --right    Right-click at coordinates
+bjs hover-xy <x> <y>       Hover at page coordinates
+bjs drag-xy <x1> <y1> <x2> <y2>   Drag between coordinates
+bjs iframe-rect <selector> Get iframe bounding box (for click-xy targeting)
 ```
 
 ## How it works
@@ -109,6 +117,30 @@ bjs screenshot /tmp/result.png      # Verify visually
 ## Shadow DOM support
 
 bjs automatically pierces shadow DOM boundaries. Sites built with web components (Reddit, GitHub, etc.) work out of the box — `elements`, `click`, `type`, and `text` all recurse into shadow roots. No special flags needed.
+
+## Coordinate commands (iframes, captchas, overlays)
+
+When you can't use `click` by index — e.g. the target is inside a **cross-origin iframe** (captcha checkbox, payment form, OAuth widget) — use coordinate-based commands that dispatch real CDP Input events at the OS level. These bypass all DOM boundaries.
+
+**Workflow for clicking inside an iframe:**
+```bash
+bjs iframe-rect 'iframe[title*="hCaptcha"]'    # Get bounding box
+# Output: x=95 y=440 w=302 h=76 center=(246, 478)
+
+bjs click-xy 125 458                            # Click checkbox position
+```
+
+`iframe-rect` returns the iframe's position on the page. Add offsets to target specific elements inside it (e.g. a checkbox is typically near the left side).
+
+**Other uses:**
+- `hover-xy` — trigger hover menus, tooltips that need mouse position
+- `drag-xy` — slider controls, drag-and-drop, canvas interactions
+- `click-xy --double` — double-click to select text, expand items
+- `click-xy --right` — context menus
+
+**When to use coordinate commands vs `click`:**
+- `click <index>` — always preferred when the element shows up in `elements`
+- `click-xy` — only when the target is inside a cross-origin iframe or otherwise unreachable by DOM indexing
 
 ## Tips
 

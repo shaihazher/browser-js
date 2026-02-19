@@ -713,6 +713,121 @@ async function cmdWait(ms) {
   return `Waited ${duration}ms`;
 }
 
+// ── Coordinate-based input (for cross-origin iframes, captchas, etc.) ──
+
+async function cmdClickXY(x, y, opts = {}) {
+  if (x === undefined || y === undefined) return "Usage: click-xy <x> <y> [--double] [--right]";
+  const px = parseFloat(x), py = parseFloat(y);
+  if (isNaN(px) || isNaN(py)) return "Error: x and y must be numbers";
+  const target = await getCurrentTarget();
+  const cdp = await connectToTarget(target.id);
+  try {
+    const button = opts.right ? "right" : "left";
+    const clickCount = opts.double ? 2 : 1;
+
+    // Move mouse first (triggers hover states, reveals tooltips)
+    await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: px, y: py });
+    await new Promise(r => setTimeout(r, 50));
+
+    // Press + release
+    await cdp.send("Input.dispatchMouseEvent", {
+      type: "mousePressed", x: px, y: py, button, clickCount
+    });
+    await cdp.send("Input.dispatchMouseEvent", {
+      type: "mouseReleased", x: px, y: py, button, clickCount
+    });
+
+    if (opts.double) {
+      // Second click for double-click
+      await cdp.send("Input.dispatchMouseEvent", {
+        type: "mousePressed", x: px, y: py, button, clickCount: 2
+      });
+      await cdp.send("Input.dispatchMouseEvent", {
+        type: "mouseReleased", x: px, y: py, button, clickCount: 2
+      });
+    }
+
+    const label = opts.double ? "Double-clicked" : opts.right ? "Right-clicked" : "Clicked";
+    return `${label} at (${px}, ${py})`;
+  } finally {
+    cdp.close();
+  }
+}
+
+async function cmdHoverXY(x, y) {
+  if (x === undefined || y === undefined) return "Usage: hover-xy <x> <y>";
+  const px = parseFloat(x), py = parseFloat(y);
+  if (isNaN(px) || isNaN(py)) return "Error: x and y must be numbers";
+  const target = await getCurrentTarget();
+  const cdp = await connectToTarget(target.id);
+  try {
+    await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: px, y: py });
+    return `Hovered at (${px}, ${py})`;
+  } finally {
+    cdp.close();
+  }
+}
+
+async function cmdDragXY(x1, y1, x2, y2) {
+  if (x1 === undefined || y1 === undefined || x2 === undefined || y2 === undefined)
+    return "Usage: drag-xy <fromX> <fromY> <toX> <toY>";
+  const sx = parseFloat(x1), sy = parseFloat(y1), ex = parseFloat(x2), ey = parseFloat(y2);
+  if ([sx, sy, ex, ey].some(isNaN)) return "Error: all coordinates must be numbers";
+  const target = await getCurrentTarget();
+  const cdp = await connectToTarget(target.id);
+  try {
+    // Move to start position
+    await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: sx, y: sy });
+    await new Promise(r => setTimeout(r, 50));
+    // Press at start
+    await cdp.send("Input.dispatchMouseEvent", {
+      type: "mousePressed", x: sx, y: sy, button: "left", clickCount: 1
+    });
+    await new Promise(r => setTimeout(r, 50));
+    // Move to end (intermediate steps for smooth drag)
+    const steps = 10;
+    for (let i = 1; i <= steps; i++) {
+      const mx = sx + (ex - sx) * (i / steps);
+      const my = sy + (ey - sy) * (i / steps);
+      await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: mx, y: my, button: "left" });
+      await new Promise(r => setTimeout(r, 20));
+    }
+    // Release at end
+    await cdp.send("Input.dispatchMouseEvent", {
+      type: "mouseReleased", x: ex, y: ey, button: "left", clickCount: 1
+    });
+    return `Dragged from (${sx}, ${sy}) to (${ex}, ${ey})`;
+  } finally {
+    cdp.close();
+  }
+}
+
+async function cmdIframeRect(selector) {
+  if (!selector) return "Usage: iframe-rect <css-selector>\nReturns bounding box of an iframe for use with click-xy";
+  const target = await getCurrentTarget();
+  const cdp = await connectToTarget(target.id);
+  try {
+    const { result, exceptionDetails } = await cdp.send("Runtime.evaluate", {
+      expression: `
+        (() => {
+          const el = document.querySelector(${JSON.stringify(selector)});
+          if (!el) return JSON.stringify({ error: "Selector not found: " + ${JSON.stringify(selector)} });
+          el.scrollIntoView({ block: 'center' });
+          const r = el.getBoundingClientRect();
+          return JSON.stringify({ x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height), cx: Math.round(r.x + r.width/2), cy: Math.round(r.y + r.height/2) });
+        })()
+      `,
+      returnByValue: true
+    });
+    if (exceptionDetails) return `Error: ${exceptionDetails.text}`;
+    const info = JSON.parse(result.value);
+    if (info.error) return info.error;
+    return `x=${info.x} y=${info.y} w=${info.width} h=${info.height} center=(${info.cx}, ${info.cy})`;
+  } finally {
+    cdp.close();
+  }
+}
+
 // ── Main ──
 
 const COMMANDS = {
@@ -723,6 +838,14 @@ const COMMANDS = {
   close: (args) => cmdClose(args[0]),
   elements: (args) => cmdElements(args[0]),
   click: (args) => cmdClick(args[0]),
+  "click-xy": (args) => {
+    const opts = { double: args.includes("--double"), right: args.includes("--right") };
+    const coords = args.filter(a => !a.startsWith("--"));
+    return cmdClickXY(coords[0], coords[1], opts);
+  },
+  "hover-xy": (args) => cmdHoverXY(args[0], args[1]),
+  "drag-xy": (args) => cmdDragXY(args[0], args[1], args[2], args[3]),
+  "iframe-rect": (args) => cmdIframeRect(args.join(" ")),
   type: (args) => cmdType(args[0], args.slice(1).join(" ")),
   text: (args) => cmdText(args[0]),
   html: (args) => cmdHtml(args[0]),
@@ -760,7 +883,14 @@ Commands:
   scroll <up|down|top|bottom> [px]
   url                     Current URL
   back / forward / refresh
+  upload <path> [selector] Upload file to input
   wait <ms>
+
+Coordinate commands (for iframes, captchas, overlays):
+  click-xy <x> <y> [--double] [--right]   Click at page coordinates
+  hover-xy <x> <y>                         Hover at page coordinates
+  drag-xy <x1> <y1> <x2> <y2>             Drag between coordinates
+  iframe-rect <css-selector>               Get iframe bounding box
 
 Env: CDP_URL (default: http://127.0.0.1:18800)`);
     return;
