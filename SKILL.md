@@ -72,6 +72,8 @@ Then `click 3` or `type 2 search query` — immediately actionable, no interpret
 
 **After navigation or AJAX changes:** Elements get re-indexed automatically on next `click`/`type` if stamps are stale. For manual re-index, call `elements` again.
 
+**Real mouse events:** `click` uses CDP `Input.dispatchMouseEvent` (mousePressed + mouseReleased) instead of JS `.click()`. This triggers React/Vue/Angular synthetic event handlers that ignore plain `.click()` calls. Works reliably on SPAs like Instagram, GitHub, LinkedIn.
+
 ## File uploads
 
 `upload` uses CDP's `DOM.setFileInputFiles` to inject files directly into hidden `<input type="file">` elements — no OS file picker dialog. Works with Instagram, Twitter, any site with file uploads.

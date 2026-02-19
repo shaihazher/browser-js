@@ -203,13 +203,28 @@ function ELEMENTS_JS(selector) {
       const interactive = root.querySelectorAll(
         'a[href], button, input, select, textarea, [role="button"], [role="link"], ' +
         '[role="tab"], [role="menuitem"], [role="checkbox"], [role="radio"], ' +
-        '[onclick], [tabindex]:not([tabindex="-1"]), details > summary, [contenteditable="true"]'
+        '[role="textbox"], [onclick], [tabindex]:not([tabindex="-1"]), details > summary, ' +
+        '[contenteditable="true"]'
       );
+
+      // Detect topmost modal/dialog to scope de-duplication
+      // Prefer role=dialog over role=presentation (presentation is often an empty overlay)
+      const allDialogs = [...document.querySelectorAll('[role=dialog], [role=presentation], [aria-modal=true]')]
+        .filter(d => d.offsetParent !== null || getComputedStyle(d).position === 'fixed');
+      const realDialogs = allDialogs.filter(d => d.getAttribute('role') === 'dialog' || d.getAttribute('aria-modal') === 'true');
+      const topDialog = (realDialogs.length > 0 ? realDialogs[realDialogs.length - 1] : allDialogs[allDialogs.length - 1]) || null;
 
       const seen = new Set();
       const results = [];
 
-      for (const el of interactive) {
+      // Sort: elements inside the top dialog come first (higher priority)
+      const sorted = [...interactive].sort((a, b) => {
+        const aInDialog = topDialog && topDialog.contains(a) ? 0 : 1;
+        const bInDialog = topDialog && topDialog.contains(b) ? 0 : 1;
+        return aInDialog - bInDialog;
+      });
+
+      for (const el of sorted) {
         if (el.offsetParent === null && el.tagName !== 'BODY' && getComputedStyle(el).position !== 'fixed') continue;
 
         const isDisabled = el.disabled || el.getAttribute('aria-disabled') === 'true';
@@ -231,6 +246,7 @@ function ELEMENTS_JS(selector) {
         else if (tag === 'input') label = type ? 'input:' + type : 'input';
         else if (tag === 'select') label = 'select';
         else if (tag === 'textarea') label = 'textarea';
+        else if (role === 'textbox') label = 'textbox';
         else if (role) label = role;
         else label = tag;
         if (isDisabled) label += ':disabled';
@@ -242,7 +258,9 @@ function ELEMENTS_JS(selector) {
           desc += desc ? ' → ' + short : short;
         }
 
-        const key = label + '|' + desc;
+        // De-dup key includes dialog scope — same label in modal vs page are different
+        const scope = (topDialog && topDialog.contains(el)) ? 'modal' : 'page';
+        const key = scope + '|' + label + '|' + desc;
         if (seen.has(key)) continue;
         seen.add(key);
 
@@ -302,20 +320,35 @@ async function cmdClick(index) {
   const cdp = await connectToTarget(target.id);
   try {
     await ensureIndexed(cdp);
+    // Get element position and info for CDP-level click
     const { result } = await cdp.send("Runtime.evaluate", {
       expression: `
         (() => {
           const el = document.querySelector('[data-bjs-idx="${index}"]');
-          if (!el) return 'Element not found at index ${index}. Try: elements';
+          if (!el) return JSON.stringify({ error: 'Element not found at index ${index}. Try: elements' });
           el.scrollIntoView({ block: 'center' });
-          el.click();
-          return 'Clicked: (' + (el.getAttribute('role') || el.tagName.toLowerCase()) + ') ' +
-            (el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 80);
+          const rect = el.getBoundingClientRect();
+          const label = (el.getAttribute('role') || el.tagName.toLowerCase());
+          const desc = (el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 80);
+          return JSON.stringify({
+            x: rect.x + rect.width / 2,
+            y: rect.y + rect.height / 2,
+            label, desc
+          });
         })()
       `,
       returnByValue: true
     });
-    return result.value;
+
+    const info = JSON.parse(result.value);
+    if (info.error) return info.error;
+
+    // Dispatch real mouse events via CDP Input domain — triggers React/Vue/Angular handlers
+    const opts = { x: info.x, y: info.y, button: "left", clickCount: 1 };
+    await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", ...opts });
+    await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...opts });
+
+    return `Clicked: (${info.label}) ${info.desc}`;
   } finally {
     cdp.close();
   }
