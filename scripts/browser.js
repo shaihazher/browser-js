@@ -360,60 +360,98 @@ async function cmdType(index, text) {
   const cdp = await connectToTarget(target.id);
   try {
     await ensureIndexed(cdp);
-    // Focus the element
+
+    // Get element info, verify it's typeable, get position for clicking
     const { result } = await cdp.send("Runtime.evaluate", {
       expression: `
         (() => {
           const el = document.querySelector('[data-bjs-idx="${index}"]');
-          if (!el) return JSON.stringify({ error: 'Element not found at index ${index}' });
+          if (!el) return JSON.stringify({ error: 'Element [${index}] not found. Run elements to re-index.' });
+          const tag = el.tagName.toLowerCase();
+          const ce = el.isContentEditable;
+          const role = el.getAttribute('role') || '';
+          const type = el.type || '';
+          const typeable = tag === 'input' || tag === 'textarea' || ce || role === 'textbox';
+          if (!typeable) return JSON.stringify({ error: 'Element [${index}] is a ' + tag + ', not a text input. Run elements to re-index.' });
           el.scrollIntoView({ block: 'center' });
-          el.focus();
-          el.value = '';
-          return JSON.stringify({ ok: true, tag: el.tagName.toLowerCase() });
+          const rect = el.getBoundingClientRect();
+          return JSON.stringify({ ok: true, tag, ce, x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 });
         })()
       `,
       returnByValue: true
     });
 
-    const status = JSON.parse(result.value);
-    if (status.error) return status.error;
+    const info = JSON.parse(result.value);
+    if (info.error) return info.error;
 
-    // Type character by character for proper event firing
-    for (const char of text) {
-      await cdp.send("Input.dispatchKeyEvent", {
-        type: "keyDown",
-        text: char,
-        key: char,
-        unmodifiedText: char
+    // Click with real mouse events for proper focus (critical for custom editors / SPAs)
+    const clickOpts = { x: info.x, y: info.y, button: "left", clickCount: 1 };
+    await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", ...clickOpts });
+    await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...clickOpts });
+    await new Promise(r => setTimeout(r, 100));
+
+    // Clear existing content
+    if (info.ce) {
+      // For contenteditable: select all via JS, then delete
+      await cdp.send("Runtime.evaluate", {
+        expression: `
+          (() => {
+            const el = document.querySelector('[data-bjs-idx="${index}"]');
+            if (el) {
+              const range = document.createRange();
+              range.selectNodeContents(el);
+              const sel = window.getSelection();
+              sel.removeAllRanges();
+              sel.addRange(range);
+            }
+          })()
+        `
       });
-      await cdp.send("Input.dispatchKeyEvent", {
-        type: "keyUp",
-        key: char
+      await cdp.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Backspace", code: "Backspace" });
+      await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Backspace", code: "Backspace" });
+    } else {
+      // For input/textarea: clear value
+      await cdp.send("Runtime.evaluate", {
+        expression: `
+          (() => {
+            const el = document.querySelector('[data-bjs-idx="${index}"]');
+            if (el) el.value = '';
+          })()
+        `
       });
     }
 
-    // Also set .value directly as backup + fire input event
-    await cdp.send("Runtime.evaluate", {
-      expression: `
-        (() => {
-          const el = document.querySelector('[data-bjs-idx="${index}"]');
-          if (el) {
-            // Use native setter to trigger React/Vue/etc state updates
-            const nativeSetter = Object.getOwnPropertyDescriptor(
-              window.HTMLInputElement.prototype, 'value'
-            )?.set || Object.getOwnPropertyDescriptor(
-              window.HTMLTextAreaElement.prototype, 'value'
-            )?.set;
-            if (nativeSetter) nativeSetter.call(el, ${JSON.stringify(text)});
-            else el.value = ${JSON.stringify(text)};
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-          }
-        })()
-      `
-    });
+    // Insert text via Input.insertText (works for both input and contenteditable)
+    try {
+      await cdp.send("Input.insertText", { text });
+    } catch (_) {
+      // Fallback: character-by-character key dispatch
+      for (const char of text) {
+        await cdp.send("Input.dispatchKeyEvent", { type: "keyDown", text: char, key: char, unmodifiedText: char });
+        await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key: char });
+      }
+    }
 
-    return `Typed "${text}" into element [${index}]`;
+    // Backup for input/textarea: also set .value directly for React/Vue state sync
+    if (!info.ce) {
+      await cdp.send("Runtime.evaluate", {
+        expression: `
+          (() => {
+            const el = document.querySelector('[data-bjs-idx="${index}"]');
+            if (el && !el.isContentEditable) {
+              const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+                || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+              if (setter) setter.call(el, ${JSON.stringify(text)});
+              else el.value = ${JSON.stringify(text)};
+              el.dispatchEvent(new Event('input', { bubbles: true }));
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+          })()
+        `
+      });
+    }
+
+    return `Typed into [${index}] (${info.tag}${info.ce ? ', contenteditable' : ''})`;
   } finally {
     cdp.close();
   }
