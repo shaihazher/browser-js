@@ -57,7 +57,9 @@ bjs wait <ms>
 
 ## How it works
 
-`elements` scans the page for all interactive elements (links, buttons, inputs, selects, etc.) and returns a compact numbered list:
+`elements` scans the page for all interactive elements (links, buttons, inputs, selects, etc.) — **including those inside shadow DOM** (web components). This means sites like Reddit, GitHub, and other modern SPAs that use shadow DOM are fully supported. The scan recursively pierces all shadow roots.
+
+Returns a compact numbered list:
 
 ```
 [0] (link) Hacker News → https://news.ycombinator.com/news
@@ -103,6 +105,10 @@ bjs type 12 "hello world"          # Type into element [12]
 bjs text                            # Read page content
 bjs screenshot /tmp/result.png      # Verify visually
 ```
+
+## Shadow DOM support
+
+bjs automatically pierces shadow DOM boundaries. Sites built with web components (Reddit, GitHub, etc.) work out of the box — `elements`, `click`, `type`, and `text` all recurse into shadow roots. No special flags needed.
 
 ## Tips
 

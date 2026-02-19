@@ -193,14 +193,50 @@ async function cmdClose(index) {
 function ELEMENTS_JS(selector) {
   return `
     (() => {
-      // Clear old stamps first
-      document.querySelectorAll('[data-bjs-idx]').forEach(el => el.removeAttribute('data-bjs-idx'));
+      // ── Deep shadow DOM helpers ──
+      function deepClearStamps(root) {
+        root.querySelectorAll('[data-bjs-idx]').forEach(el => el.removeAttribute('data-bjs-idx'));
+        root.querySelectorAll('*').forEach(el => {
+          if (el.shadowRoot) deepClearStamps(el.shadowRoot);
+        });
+      }
+
+      function deepQueryAll(root, selectors) {
+        const results = [];
+        try { results.push(...root.querySelectorAll(selectors)); } catch(e) {}
+        const allEls = root.querySelectorAll('*');
+        for (const el of allEls) {
+          if (el.shadowRoot) {
+            results.push(...deepQueryAll(el.shadowRoot, selectors));
+          }
+        }
+        return results;
+      }
+
+      function deepQueryStamp(root, idx) {
+        const found = root.querySelector('[data-bjs-idx="' + idx + '"]');
+        if (found) return found;
+        const allEls = root.querySelectorAll('*');
+        for (const el of allEls) {
+          if (el.shadowRoot) {
+            const deep = deepQueryStamp(el.shadowRoot, idx);
+            if (deep) return deep;
+          }
+        }
+        return null;
+      }
+
+      // Expose deepQueryStamp globally for click/type/etc
+      window.__bjsDeepQuery = (idx) => deepQueryStamp(document, idx);
+
+      // Clear old stamps first (including inside shadow DOMs)
+      deepClearStamps(document);
 
       const sel = ${JSON.stringify(selector)};
       const root = sel ? document.querySelector(sel) : document;
       if (!root) return JSON.stringify({ error: "Selector not found: " + sel });
 
-      const interactive = root.querySelectorAll(
+      const interactive = deepQueryAll(root,
         'a[href], button, input, select, textarea, [role="button"], [role="link"], ' +
         '[role="tab"], [role="menuitem"], [role="checkbox"], [role="radio"], ' +
         '[role="textbox"], [onclick], [tabindex]:not([tabindex="-1"]), details > summary, ' +
@@ -300,7 +336,7 @@ async function cmdElements(selector) {
 // Ensure elements are indexed; returns true if re-indexed
 async function ensureIndexed(cdp) {
   const { result } = await cdp.send("Runtime.evaluate", {
-    expression: `!!document.querySelector('[data-bjs-idx]')`,
+    expression: `!!(document.querySelector('[data-bjs-idx]') || (window.__bjsDeepQuery && window.__bjsDeepQuery(0)))`,
     returnByValue: true
   });
   if (!result.value) {
@@ -324,7 +360,7 @@ async function cmdClick(index) {
     const { result } = await cdp.send("Runtime.evaluate", {
       expression: `
         (() => {
-          const el = document.querySelector('[data-bjs-idx="${index}"]');
+          const el = (window.__bjsDeepQuery && window.__bjsDeepQuery(${index})) || document.querySelector('[data-bjs-idx="${index}"]');
           if (!el) return JSON.stringify({ error: 'Element not found at index ${index}. Try: elements' });
           el.scrollIntoView({ block: 'center' });
           const rect = el.getBoundingClientRect();
@@ -365,7 +401,7 @@ async function cmdType(index, text) {
     const { result } = await cdp.send("Runtime.evaluate", {
       expression: `
         (() => {
-          const el = document.querySelector('[data-bjs-idx="${index}"]');
+          const el = (window.__bjsDeepQuery && window.__bjsDeepQuery(${index})) || document.querySelector('[data-bjs-idx="${index}"]');
           if (!el) return JSON.stringify({ error: 'Element [${index}] not found. Run elements to re-index.' });
           const tag = el.tagName.toLowerCase();
           const ce = el.isContentEditable;
@@ -396,7 +432,7 @@ async function cmdType(index, text) {
       await cdp.send("Runtime.evaluate", {
         expression: `
           (() => {
-            const el = document.querySelector('[data-bjs-idx="${index}"]');
+            const el = (window.__bjsDeepQuery && window.__bjsDeepQuery(${index})) || document.querySelector('[data-bjs-idx="${index}"]');
             if (el) {
               const range = document.createRange();
               range.selectNodeContents(el);
@@ -414,7 +450,7 @@ async function cmdType(index, text) {
       await cdp.send("Runtime.evaluate", {
         expression: `
           (() => {
-            const el = document.querySelector('[data-bjs-idx="${index}"]');
+            const el = (window.__bjsDeepQuery && window.__bjsDeepQuery(${index})) || document.querySelector('[data-bjs-idx="${index}"]');
             if (el) el.value = '';
           })()
         `
@@ -437,7 +473,7 @@ async function cmdType(index, text) {
       await cdp.send("Runtime.evaluate", {
         expression: `
           (() => {
-            const el = document.querySelector('[data-bjs-idx="${index}"]');
+            const el = (window.__bjsDeepQuery && window.__bjsDeepQuery(${index})) || document.querySelector('[data-bjs-idx="${index}"]');
             if (el && !el.isContentEditable) {
               const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
                 || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
@@ -468,29 +504,37 @@ async function cmdText(selector) {
           const root = sel ? document.querySelector(sel) : document.body;
           if (!root) return 'Selector not found: ' + sel;
 
-          // Get text content, collapse whitespace, limit size
-          const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-            acceptNode: (node) => {
-              const parent = node.parentElement;
-              if (!parent) return NodeFilter.FILTER_REJECT;
-              const tag = parent.tagName;
-              if (['SCRIPT', 'STYLE', 'NOSCRIPT', 'SVG'].includes(tag)) return NodeFilter.FILTER_REJECT;
-              if (parent.offsetParent === null && getComputedStyle(parent).position !== 'fixed') return NodeFilter.FILTER_REJECT;
-              return NodeFilter.FILTER_ACCEPT;
-            }
-          });
-
+          const MAX = 8000;
           const chunks = [];
           let totalLen = 0;
-          const MAX = 8000;
-          let node;
-          while ((node = walker.nextNode()) && totalLen < MAX) {
-            const t = node.textContent.trim();
-            if (t.length > 0) {
-              chunks.push(t);
-              totalLen += t.length;
+
+          // Recursive text extraction that pierces shadow DOM
+          function extractText(node) {
+            if (totalLen >= MAX) return;
+            if (node.nodeType === 3) { // TEXT_NODE
+              const t = node.textContent.trim();
+              if (t.length > 0) {
+                const parent = node.parentElement;
+                if (parent) {
+                  const tag = parent.tagName;
+                  if (['SCRIPT', 'STYLE', 'NOSCRIPT', 'SVG'].includes(tag)) return;
+                  if (parent.offsetParent === null && getComputedStyle(parent).position !== 'fixed') return;
+                }
+                chunks.push(t);
+                totalLen += t.length;
+              }
+              return;
+            }
+            if (node.nodeType === 1) { // ELEMENT_NODE
+              // Enter shadow root if present
+              if (node.shadowRoot) {
+                for (const child of node.shadowRoot.childNodes) extractText(child);
+              }
+              for (const child of node.childNodes) extractText(child);
             }
           }
+
+          extractText(root);
           let text = chunks.join(' ').replace(/\\s+/g, ' ').trim();
           if (text.length > MAX) text = text.slice(0, MAX) + '... (truncated)';
           return text || '(empty page)';
