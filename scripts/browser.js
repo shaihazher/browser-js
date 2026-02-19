@@ -211,7 +211,8 @@ function ELEMENTS_JS(selector) {
 
       for (const el of interactive) {
         if (el.offsetParent === null && el.tagName !== 'BODY' && getComputedStyle(el).position !== 'fixed') continue;
-        if (el.disabled) continue;
+
+        const isDisabled = el.disabled || el.getAttribute('aria-disabled') === 'true';
 
         const tag = el.tagName.toLowerCase();
         const type = el.type || '';
@@ -232,6 +233,7 @@ function ELEMENTS_JS(selector) {
         else if (tag === 'textarea') label = 'textarea';
         else if (role) label = role;
         else label = tag;
+        if (isDisabled) label += ':disabled';
 
         let desc = ariaLabel || text || placeholder || name || '';
         if (value && !desc.includes(value)) desc += desc ? ' [' + value + ']' : value;
