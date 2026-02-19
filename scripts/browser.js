@@ -1,0 +1,667 @@
+#!/usr/bin/env node
+const { writeFileSync } = require("fs");
+/**
+ * browser.js — Lightweight CDP browser control for AI agents.
+ *
+ * Connects to the OpenClaw managed browser (or any Chrome with --remote-debugging-port)
+ * and exposes minimal, indexed commands that burn almost no tokens.
+ *
+ * Usage:
+ *   node browser.js <command> [args...]
+ *
+ * Commands:
+ *   tabs                    List open tabs (index + title + url)
+ *   open <url>              Navigate current tab (or first tab) to URL
+ *   tab <index>             Switch active tab by index
+ *   newtab [url]            Open a new tab (optionally with URL)
+ *   close [index]           Close tab by index (default: current)
+ *   elements [selector]     List interactive elements as numbered index
+ *   click <index>           Click element by index
+ *   type <index> <text>     Type text into element by index
+ *   text [selector]         Extract visible text (compact)
+ *   html [selector]         Get outerHTML of element (by CSS selector)
+ *   eval <js>               Evaluate JS in page context
+ *   screenshot [path]       Save screenshot to file
+ *   wait <ms>               Wait for ms (useful in scripts)
+ *   scroll <dir> [amount]   Scroll up/down/top/bottom
+ *   url                     Print current URL
+ *   back                    Go back
+ *   forward                 Go forward
+ *   refresh                 Reload page
+ *
+ * Env:
+ *   CDP_URL   Override CDP endpoint (default: http://127.0.0.1:18800)
+ */
+
+const WebSocket = require("ws");
+
+const CDP_URL = process.env.CDP_URL || "http://127.0.0.1:18800";
+
+// ── Helpers ──
+
+async function cdpFetch(path) {
+  const res = await fetch(`${CDP_URL}${path}`);
+  return res.json();
+}
+
+async function getTargets() {
+  return cdpFetch("/json/list");
+}
+
+async function getWsUrl() {
+  const ver = await cdpFetch("/json/version");
+  return ver.webSocketDebuggerUrl?.replace(/^ws:\/\/[^/]+/, `ws://127.0.0.1:${new URL(CDP_URL).port}`);
+}
+
+// ── CDP WebSocket session ──
+
+class CDPSession {
+  constructor(ws) {
+    this.ws = ws;
+    this.id = 1;
+    this.pending = new Map();
+    ws.on("message", (data) => {
+      const msg = JSON.parse(data.toString());
+      if (msg.id && this.pending.has(msg.id)) {
+        const { resolve, reject } = this.pending.get(msg.id);
+        this.pending.delete(msg.id);
+        if (msg.error) reject(new Error(msg.error.message));
+        else resolve(msg.result);
+      }
+    });
+  }
+
+  send(method, params = {}) {
+    return new Promise((resolve, reject) => {
+      const id = this.id++;
+      this.pending.set(id, { resolve, reject });
+      this.ws.send(JSON.stringify({ id, method, params }));
+    });
+  }
+
+  close() {
+    this.ws.close();
+  }
+}
+
+async function connectToTarget(targetId) {
+  const port = new URL(CDP_URL).port;
+  const wsUrl = `ws://127.0.0.1:${port}/devtools/page/${targetId}`;
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(wsUrl);
+    ws.once("open", () => resolve(new CDPSession(ws)));
+    ws.once("error", reject);
+  });
+}
+
+async function connectToBrowser() {
+  const wsUrl = await getWsUrl();
+  if (!wsUrl) throw new Error("Cannot get browser WebSocket URL");
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(wsUrl);
+    ws.once("open", () => resolve(new CDPSession(ws)));
+    ws.once("error", reject);
+  });
+}
+
+// Get the "current" page target (first visible page tab)
+async function getCurrentTarget() {
+  const targets = await getTargets();
+  const pages = targets.filter(t => t.type === "page");
+  if (pages.length === 0) throw new Error("No page tabs open");
+  return pages[0];
+}
+
+async function getTargetByIndex(index) {
+  const targets = await getTargets();
+  const pages = targets.filter(t => t.type === "page");
+  if (index < 0 || index >= pages.length) throw new Error(`Tab index ${index} out of range (0-${pages.length - 1})`);
+  return pages[index];
+}
+
+// ── Commands ──
+
+async function cmdTabs() {
+  const targets = await getTargets();
+  const pages = targets.filter(t => t.type === "page");
+  if (pages.length === 0) return "No tabs open.";
+  return pages.map((t, i) => `[${i}] ${t.title || "(untitled)"} — ${t.url}`).join("\n");
+}
+
+async function cmdOpen(url) {
+  if (!url) return "Usage: open <url>";
+  if (!url.startsWith("http")) url = "https://" + url;
+  const target = await getCurrentTarget();
+  const cdp = await connectToTarget(target.id);
+  try {
+    await cdp.send("Page.navigate", { url });
+    // Wait for load
+    await cdp.send("Page.enable");
+    await new Promise((resolve) => {
+      const timeout = setTimeout(resolve, 10000);
+      cdp.ws.on("message", (data) => {
+        const msg = JSON.parse(data.toString());
+        if (msg.method === "Page.loadEventFired") {
+          clearTimeout(timeout);
+          resolve();
+        }
+      });
+    });
+    return `Navigated to ${url}`;
+  } finally {
+    cdp.close();
+  }
+}
+
+async function cmdTab(index) {
+  const target = await getTargetByIndex(parseInt(index));
+  const cdp = await connectToTarget(target.id);
+  try {
+    await cdp.send("Page.bringToFront");
+    return `Switched to tab [${index}]: ${target.title} — ${target.url}`;
+  } finally {
+    cdp.close();
+  }
+}
+
+async function cmdNewTab(url) {
+  const browser = await connectToBrowser();
+  try {
+    const result = await browser.send("Target.createTarget", {
+      url: url || "about:blank"
+    });
+    return `Opened new tab: ${result.targetId}`;
+  } finally {
+    browser.close();
+  }
+}
+
+async function cmdClose(index) {
+  const target = index !== undefined
+    ? await getTargetByIndex(parseInt(index))
+    : await getCurrentTarget();
+  const browser = await connectToBrowser();
+  try {
+    await browser.send("Target.closeTarget", { targetId: target.id });
+    return `Closed tab: ${target.title}`;
+  } finally {
+    browser.close();
+  }
+}
+
+// Generate the JS expression that indexes interactive elements
+function ELEMENTS_JS(selector) {
+  return `
+    (() => {
+      // Clear old stamps first
+      document.querySelectorAll('[data-bjs-idx]').forEach(el => el.removeAttribute('data-bjs-idx'));
+
+      const sel = ${JSON.stringify(selector)};
+      const root = sel ? document.querySelector(sel) : document;
+      if (!root) return JSON.stringify({ error: "Selector not found: " + sel });
+
+      const interactive = root.querySelectorAll(
+        'a[href], button, input, select, textarea, [role="button"], [role="link"], ' +
+        '[role="tab"], [role="menuitem"], [role="checkbox"], [role="radio"], ' +
+        '[onclick], [tabindex]:not([tabindex="-1"]), details > summary, [contenteditable="true"]'
+      );
+
+      const seen = new Set();
+      const results = [];
+
+      for (const el of interactive) {
+        if (el.offsetParent === null && el.tagName !== 'BODY' && getComputedStyle(el).position !== 'fixed') continue;
+        if (el.disabled) continue;
+
+        const tag = el.tagName.toLowerCase();
+        const type = el.type || '';
+        const role = el.getAttribute('role') || '';
+        const text = (el.textContent || '').trim().slice(0, 80).replace(/\\s+/g, ' ');
+        const ariaLabel = el.getAttribute('aria-label') || '';
+        const placeholder = el.placeholder || '';
+        const href = el.href || '';
+        const name = el.name || '';
+        const value = (tag === 'input' || tag === 'select' || tag === 'textarea')
+          ? (el.value || '').slice(0, 40) : '';
+
+        let label = '';
+        if (tag === 'a') label = 'link';
+        else if (tag === 'button' || role === 'button') label = 'button';
+        else if (tag === 'input') label = type ? 'input:' + type : 'input';
+        else if (tag === 'select') label = 'select';
+        else if (tag === 'textarea') label = 'textarea';
+        else if (role) label = role;
+        else label = tag;
+
+        let desc = ariaLabel || text || placeholder || name || '';
+        if (value && !desc.includes(value)) desc += desc ? ' [' + value + ']' : value;
+        if (tag === 'a' && href && !href.startsWith('javascript:')) {
+          const short = href.length > 60 ? href.slice(0, 57) + '...' : href;
+          desc += desc ? ' → ' + short : short;
+        }
+
+        const key = label + '|' + desc;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        el.setAttribute('data-bjs-idx', results.length);
+        results.push({ label, desc: desc.slice(0, 120) });
+      }
+
+      return JSON.stringify(results);
+    })()
+  `;
+}
+
+async function cmdElements(selector) {
+  const target = await getCurrentTarget();
+  const cdp = await connectToTarget(target.id);
+  try {
+    await cdp.send("DOM.enable");
+    await cdp.send("Runtime.enable");
+
+    const { result } = await cdp.send("Runtime.evaluate", {
+      expression: ELEMENTS_JS(selector || null),
+      returnByValue: true
+    });
+
+    const elements = JSON.parse(result.value);
+    if (elements.error) return elements.error;
+    if (elements.length === 0) return "No interactive elements found.";
+
+    return elements.map((e, i) =>
+      `[${i}] (${e.label}) ${e.desc}`
+    ).join("\n");
+  } finally {
+    cdp.close();
+  }
+}
+
+// Ensure elements are indexed; returns true if re-indexed
+async function ensureIndexed(cdp) {
+  const { result } = await cdp.send("Runtime.evaluate", {
+    expression: `!!document.querySelector('[data-bjs-idx]')`,
+    returnByValue: true
+  });
+  if (!result.value) {
+    // No stamps exist — auto-index
+    await cdp.send("Runtime.evaluate", {
+      expression: ELEMENTS_JS(null),
+      returnByValue: true
+    });
+    return true;
+  }
+  return false;
+}
+
+async function cmdClick(index) {
+  if (index === undefined) return "Usage: click <index>";
+  const target = await getCurrentTarget();
+  const cdp = await connectToTarget(target.id);
+  try {
+    await ensureIndexed(cdp);
+    const { result } = await cdp.send("Runtime.evaluate", {
+      expression: `
+        (() => {
+          const el = document.querySelector('[data-bjs-idx="${index}"]');
+          if (!el) return 'Element not found at index ${index}. Try: elements';
+          el.scrollIntoView({ block: 'center' });
+          el.click();
+          return 'Clicked: (' + (el.getAttribute('role') || el.tagName.toLowerCase()) + ') ' +
+            (el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 80);
+        })()
+      `,
+      returnByValue: true
+    });
+    return result.value;
+  } finally {
+    cdp.close();
+  }
+}
+
+async function cmdType(index, text) {
+  if (index === undefined || !text) return "Usage: type <index> <text>";
+  const target = await getCurrentTarget();
+  const cdp = await connectToTarget(target.id);
+  try {
+    await ensureIndexed(cdp);
+    // Focus the element
+    const { result } = await cdp.send("Runtime.evaluate", {
+      expression: `
+        (() => {
+          const el = document.querySelector('[data-bjs-idx="${index}"]');
+          if (!el) return JSON.stringify({ error: 'Element not found at index ${index}' });
+          el.scrollIntoView({ block: 'center' });
+          el.focus();
+          el.value = '';
+          return JSON.stringify({ ok: true, tag: el.tagName.toLowerCase() });
+        })()
+      `,
+      returnByValue: true
+    });
+
+    const status = JSON.parse(result.value);
+    if (status.error) return status.error;
+
+    // Type character by character for proper event firing
+    for (const char of text) {
+      await cdp.send("Input.dispatchKeyEvent", {
+        type: "keyDown",
+        text: char,
+        key: char,
+        unmodifiedText: char
+      });
+      await cdp.send("Input.dispatchKeyEvent", {
+        type: "keyUp",
+        key: char
+      });
+    }
+
+    // Also set .value directly as backup + fire input event
+    await cdp.send("Runtime.evaluate", {
+      expression: `
+        (() => {
+          const el = document.querySelector('[data-bjs-idx="${index}"]');
+          if (el) {
+            // Use native setter to trigger React/Vue/etc state updates
+            const nativeSetter = Object.getOwnPropertyDescriptor(
+              window.HTMLInputElement.prototype, 'value'
+            )?.set || Object.getOwnPropertyDescriptor(
+              window.HTMLTextAreaElement.prototype, 'value'
+            )?.set;
+            if (nativeSetter) nativeSetter.call(el, ${JSON.stringify(text)});
+            else el.value = ${JSON.stringify(text)};
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        })()
+      `
+    });
+
+    return `Typed "${text}" into element [${index}]`;
+  } finally {
+    cdp.close();
+  }
+}
+
+async function cmdText(selector) {
+  const target = await getCurrentTarget();
+  const cdp = await connectToTarget(target.id);
+  try {
+    const { result } = await cdp.send("Runtime.evaluate", {
+      expression: `
+        (() => {
+          const sel = ${JSON.stringify(selector || null)};
+          const root = sel ? document.querySelector(sel) : document.body;
+          if (!root) return 'Selector not found: ' + sel;
+
+          // Get text content, collapse whitespace, limit size
+          const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+            acceptNode: (node) => {
+              const parent = node.parentElement;
+              if (!parent) return NodeFilter.FILTER_REJECT;
+              const tag = parent.tagName;
+              if (['SCRIPT', 'STYLE', 'NOSCRIPT', 'SVG'].includes(tag)) return NodeFilter.FILTER_REJECT;
+              if (parent.offsetParent === null && getComputedStyle(parent).position !== 'fixed') return NodeFilter.FILTER_REJECT;
+              return NodeFilter.FILTER_ACCEPT;
+            }
+          });
+
+          const chunks = [];
+          let totalLen = 0;
+          const MAX = 8000;
+          let node;
+          while ((node = walker.nextNode()) && totalLen < MAX) {
+            const t = node.textContent.trim();
+            if (t.length > 0) {
+              chunks.push(t);
+              totalLen += t.length;
+            }
+          }
+          let text = chunks.join(' ').replace(/\\s+/g, ' ').trim();
+          if (text.length > MAX) text = text.slice(0, MAX) + '... (truncated)';
+          return text || '(empty page)';
+        })()
+      `,
+      returnByValue: true
+    });
+    return result.value;
+  } finally {
+    cdp.close();
+  }
+}
+
+async function cmdHtml(selector) {
+  if (!selector) return "Usage: html <css-selector>";
+  const target = await getCurrentTarget();
+  const cdp = await connectToTarget(target.id);
+  try {
+    const { result } = await cdp.send("Runtime.evaluate", {
+      expression: `
+        (() => {
+          const el = document.querySelector(${JSON.stringify(selector)});
+          if (!el) return 'Selector not found: ' + ${JSON.stringify(selector)};
+          const html = el.outerHTML;
+          return html.length > 10000 ? html.slice(0, 10000) + '... (truncated)' : html;
+        })()
+      `,
+      returnByValue: true
+    });
+    return result.value;
+  } finally {
+    cdp.close();
+  }
+}
+
+async function cmdEval(js) {
+  if (!js) return "Usage: eval <javascript>";
+  const target = await getCurrentTarget();
+  const cdp = await connectToTarget(target.id);
+  try {
+    const { result, exceptionDetails } = await cdp.send("Runtime.evaluate", {
+      expression: js,
+      returnByValue: true,
+      awaitPromise: true
+    });
+    if (exceptionDetails) {
+      return `Error: ${exceptionDetails.exception?.description || exceptionDetails.text}`;
+    }
+    if (result.value !== undefined) return typeof result.value === 'string' ? result.value : JSON.stringify(result.value, null, 2);
+    if (result.description) return result.description;
+    return result.type === 'undefined' ? '(undefined)' : JSON.stringify(result);
+  } finally {
+    cdp.close();
+  }
+}
+
+async function cmdScreenshot(filePath) {
+  const target = await getCurrentTarget();
+  const cdp = await connectToTarget(target.id);
+  try {
+    const { data } = await cdp.send("Page.captureScreenshot", { format: "png" });
+    const outPath = filePath || `/tmp/browser_screenshot_${Date.now()}.png`;
+    writeFileSync(outPath, Buffer.from(data, "base64"));
+    return `Screenshot saved: ${outPath}`;
+  } finally {
+    cdp.close();
+  }
+}
+
+async function cmdScroll(direction, amount) {
+  const target = await getCurrentTarget();
+  const cdp = await connectToTarget(target.id);
+  try {
+    const px = parseInt(amount) || 600;
+    let expr;
+    switch (direction) {
+      case "up": expr = `window.scrollBy(0, -${px})`; break;
+      case "down": expr = `window.scrollBy(0, ${px})`; break;
+      case "top": expr = `window.scrollTo(0, 0)`; break;
+      case "bottom": expr = `window.scrollTo(0, document.body.scrollHeight)`; break;
+      default: return "Usage: scroll <up|down|top|bottom> [pixels]";
+    }
+    await cdp.send("Runtime.evaluate", { expression: expr });
+    return `Scrolled ${direction}${amount ? ` ${amount}px` : ''}`;
+  } finally {
+    cdp.close();
+  }
+}
+
+async function cmdUrl() {
+  const target = await getCurrentTarget();
+  return target.url;
+}
+
+async function cmdBack() {
+  const target = await getCurrentTarget();
+  const cdp = await connectToTarget(target.id);
+  try {
+    const { currentIndex, entries } = await cdp.send("Page.getNavigationHistory");
+    if (currentIndex > 0) {
+      await cdp.send("Page.navigateToHistoryEntry", { entryId: entries[currentIndex - 1].id });
+      return `Back to: ${entries[currentIndex - 1].url}`;
+    }
+    return "Already at first page in history.";
+  } finally {
+    cdp.close();
+  }
+}
+
+async function cmdForward() {
+  const target = await getCurrentTarget();
+  const cdp = await connectToTarget(target.id);
+  try {
+    const { currentIndex, entries } = await cdp.send("Page.getNavigationHistory");
+    if (currentIndex < entries.length - 1) {
+      await cdp.send("Page.navigateToHistoryEntry", { entryId: entries[currentIndex + 1].id });
+      return `Forward to: ${entries[currentIndex + 1].url}`;
+    }
+    return "Already at last page in history.";
+  } finally {
+    cdp.close();
+  }
+}
+
+async function cmdRefresh() {
+  const target = await getCurrentTarget();
+  const cdp = await connectToTarget(target.id);
+  try {
+    await cdp.send("Page.reload");
+    return "Refreshed.";
+  } finally {
+    cdp.close();
+  }
+}
+
+async function cmdUpload(filePath, selector) {
+  if (!filePath) return "Usage: upload <file-path> [css-selector]\nDefault selector: input[type=file]";
+  const { existsSync, realpathSync } = require("fs");
+  const path = require("path");
+
+  // Resolve to absolute path
+  const absPath = path.resolve(filePath);
+  if (!existsSync(absPath)) return `File not found: ${absPath}`;
+
+  const target = await getCurrentTarget();
+  const cdp = await connectToTarget(target.id);
+  try {
+    await cdp.send("DOM.enable");
+
+    const cssSelector = selector || 'input[type="file"]';
+
+    // Get the DOM node for the file input
+    const { root } = await cdp.send("DOM.getDocument");
+    const { nodeId } = await cdp.send("DOM.querySelector", {
+      nodeId: root.nodeId,
+      selector: cssSelector
+    });
+
+    if (!nodeId) return `No file input found matching: ${cssSelector}`;
+
+    // Set the file on the input
+    await cdp.send("DOM.setFileInputFiles", {
+      files: [absPath],
+      nodeId: nodeId
+    });
+
+    return `Uploaded: ${path.basename(absPath)} → ${cssSelector}`;
+  } finally {
+    cdp.close();
+  }
+}
+
+async function cmdWait(ms) {
+  const duration = parseInt(ms) || 1000;
+  await new Promise(r => setTimeout(r, duration));
+  return `Waited ${duration}ms`;
+}
+
+// ── Main ──
+
+const COMMANDS = {
+  tabs: () => cmdTabs(),
+  open: (args) => cmdOpen(args[0]),
+  tab: (args) => cmdTab(args[0]),
+  newtab: (args) => cmdNewTab(args[0]),
+  close: (args) => cmdClose(args[0]),
+  elements: (args) => cmdElements(args[0]),
+  click: (args) => cmdClick(args[0]),
+  type: (args) => cmdType(args[0], args.slice(1).join(" ")),
+  text: (args) => cmdText(args[0]),
+  html: (args) => cmdHtml(args[0]),
+  eval: (args) => cmdEval(args.join(" ")),
+  screenshot: (args) => cmdScreenshot(args[0]),
+  scroll: (args) => cmdScroll(args[0], args[1]),
+  url: () => cmdUrl(),
+  back: () => cmdBack(),
+  forward: () => cmdForward(),
+  refresh: () => cmdRefresh(),
+  upload: (args) => cmdUpload(args[0], args[1]),
+  wait: (args) => cmdWait(args[0]),
+};
+
+async function main() {
+  const args = process.argv.slice(2);
+  const cmd = args[0]?.toLowerCase();
+
+  if (!cmd || cmd === "help" || cmd === "--help") {
+    console.log(`browser.js — Lightweight CDP browser control
+
+Commands:
+  tabs                    List open tabs
+  open <url>              Navigate to URL
+  tab <index>             Switch to tab by index
+  newtab [url]            Open new tab
+  close [index]           Close tab
+  elements [selector]     List interactive elements (indexed)
+  click <index>           Click element by index
+  type <index> <text>     Type into element
+  text [selector]         Extract page text
+  html <selector>         Get element HTML
+  eval <js>               Run JavaScript
+  screenshot [path]       Save screenshot
+  scroll <up|down|top|bottom> [px]
+  url                     Current URL
+  back / forward / refresh
+  wait <ms>
+
+Env: CDP_URL (default: http://127.0.0.1:18800)`);
+    return;
+  }
+
+  const handler = COMMANDS[cmd];
+  if (!handler) {
+    console.error(`Unknown command: ${cmd}\nRun "browser.js help" for usage.`);
+    process.exit(1);
+  }
+
+  try {
+    const result = await handler(args.slice(1));
+    if (result) console.log(result);
+  } catch (err) {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+main();
